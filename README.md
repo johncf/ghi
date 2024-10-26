@@ -7,6 +7,8 @@ A single python script to download, extract and install (read "copy to `$HOME/.l
 * Python 3.10+
 * Python [`requests` package](https://pypi.org/project/requests/)
   * Note: This is [often](https://packages.debian.org/bookworm/python3-requests) [already](https://packages.ubuntu.com/noble/python3-requests) [installed](https://archlinux.org/packages/extra/any/python-requests/) as a system package.
+* (optional) `wget` or `curl`
+  * Note: if neither is available, uses `requests` to download (which may be slower and not so robust)
 
 ## Installation
 
@@ -44,10 +46,4 @@ To list last 30 releases:
 
 ```sh
 ghi ls pypa/hatch
-```
-
-## Upgrade `ghi`
-
-```sh
-ghi get johncf/ghi
 ```

@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 
 import argparse
-import json
 import os
 import platform
 import re
+import shutil
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import requests
 
 _TARGET_DIR = Path.home() / ".local" / "bin"
 GHI_TARGET_DIR = os.environ.get("GHI_TARGET_DIR", str(_TARGET_DIR))
+GITHUB_API_HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 
 
 def cli():
@@ -28,13 +31,12 @@ def cli():
     # ls command
     parser_ls = subparsers.add_parser("ls", help="list releases")
     parser_ls.add_argument("repo", type=str, help="name or url of the repo")
+    parser_ls.add_argument("-n", type=int, default=10, help="number of releases to list [default: 10]")
     parser_ls.set_defaults(func=cli_ls)
 
     args = parser.parse_args()
     args.func(args)
 
-
-GITHUB_API_HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 
 def cli_get(args):
     owner, repo = process_github_url(args.repo)
@@ -42,25 +44,75 @@ def cli_get(args):
     keywords = args.k or []
     keywords.extend(get_platform_keywords())
 
+    # fetch release data
     response = requests.get(
         f"https://api.github.com/repos/{owner}/{repo}/releases/{version}",
         headers=GITHUB_API_HEADERS,
     )
+    if not response.ok:
+        print(f"Error {response.status_code}:", response.text)
+        return
     data = response.json()
-    print(json.dumps(data, indent=4))
+    info = [key for key in ["draft", "prerelease"] if data[key]]
+    info_str = f"({', '.join(info)})" if info else ""
+    print("Release:", data["name"], info_str)
+    print("    tag:", data['tag_name'])
+    print("    published:", data['published_at'])
+
+    # extract asset metadata
+    assets = [
+        Asset(name=asset["name"], size=asset["size"], dl_url=asset["browser_download_url"])
+        for asset in data["assets"]
+        if not asset["name"].endswith(".sha256")
+    ]
+    asset_names = [asset.name for asset in assets]
+    ranked_indices = rerank_list(asset_names, keywords)
+
+    # download a user-chosen asset
+    ranked_details = [f"{assets[i].name} ({size_fmt(assets[i].size)})"
+                      for i in ranked_indices]
+    chosen_index = pick("Choose an asset", ranked_details)
+    chosen_asset = assets[ranked_indices[chosen_index]]
+    output_path = chosen_asset.name  # TODO temp/cache directory
+    print("Downloading:", chosen_asset.dl_url)
+    dl = Downloader()
+    dl.download(output_path, chosen_asset.dl_url)
+
+    # extract the pre-built binary from the downloaded asset
+    # TODO
 
 
 def cli_ls(args):
     owner, repo = process_github_url(args.repo)
     response = requests.get(
-        f"https://api.github.com/repos/{owner}/{repo}/releases",
+        f"https://api.github.com/repos/{owner}/{repo}/releases?per_page={args.n}",
         headers=GITHUB_API_HEADERS,
     )
+    if not response.ok:
+        print(f"Error {response.status_code}:", response.text)
+        return
     data = response.json()
-    # print(json.dumps(data))
-    # TODO error handling
     for release in data:
         print(release["tag_name"], "::", release["published_at"])
+
+
+def get_platform_keywords():
+    keywords = []
+    system = platform.system().lower()
+    if system == "linux":
+        keywords.extend(["linux", "unknown"])
+    elif system == "windows":
+        keywords.extend(["windows", "msvc", ".msi", ".exe"])
+    elif system == "darwin":
+        keywords.extend(["apple", "darwin", ".pkg"])
+    else:
+        keywords.append(system)
+    machine = platform.machine().lower()
+    if machine in {"x86_64", "amd64"}:
+        keywords.extend(["x86_64", "amd64", "x64"])
+    else:
+        keywords.append(machine)
+    return keywords
 
 
 def process_github_url(repo_url):
@@ -74,23 +126,68 @@ def process_github_url(repo_url):
         raise ValueError(f"Invalid Github URL: {repo_url}")
 
 
-def get_platform_keywords():
-    keywords = []
-    system = platform.system().lower()
-    if system == "linux":
-        keywords.extend(["linux", "unknown"])
-    elif system == "windows":
-        keywords.extend(["windows", "msvc", "-pc", ".msi", ".exe"])
-    elif system == "darwin":
-        keywords.extend(["apple", "darwin"])
-    else:
-        keywords.append(system)
-    machine = platform.machine().lower()
-    if machine in {"x86_64", "amd64"}:
-        keywords.extend(["x86_64", "amd64", "x64"])
-    else:
-        keywords.append(machine)
-    return keywords
+def rerank_list(names, keywords):
+    weights = [-sum(kw in name for kw in keywords) for name in names]
+    return [index for _, _, index in sorted(zip(weights, names, range(len(names))))]
+
+
+def pick(prompt, choices):
+    print()
+    for index, choice in reversed(list(enumerate(choices))):
+        print(f" ({index:3})", choice)
+    print()
+    index_str = input(f"{prompt} [default=0] ")
+    if index_str == "":
+        index_str = "0"
+    if not index_str.isdigit():
+        raise ValueError(f"Invalid choice: {index_str}")
+    index = int(index_str)
+    if index >= len(choices):
+        raise ValueError(f"Choice too big: {index} > {len(choices) - 1}")
+    return index
+
+
+# based on https://stackoverflow.com/a/1094933/2849934
+def size_fmt(num: int) -> str:
+    if abs(num) < 1024:
+        return f"{num} B"
+    for unit in ("KiB", "MiB", "GiB"):
+        num /= 1024
+        if abs(num) < 1024:
+            return f"{num:.1f} {unit}"
+    return f"{num / 1024:.1f} TiB"
+
+
+@dataclass(kw_only=True)
+class Asset:
+    name: str
+    size: int
+    dl_url: str
+
+
+class Downloader:
+    __slots__ = ("download",)
+
+    def __init__(self):
+        if shutil.which("curl") is not None:
+            self.download = self._curl
+        elif shutil.which("wget") is not None:
+            self.download = self._wget
+        else:
+            self.download = self._pyreq
+
+    def _wget(self, outfile, url):
+        subprocess.run(["wget", "-nv", "-O", outfile, url])
+
+    def _curl(self, outfile, url):
+        subprocess.run(["curl", "-sS", "-fLo", outfile, url])
+
+    def _pyreq(self, outfile, url):
+        with requests.get(url, stream=True) as resp:
+            resp.raise_for_status()
+            with open(outfile, "wb") as f:
+                for chunk in resp.iter_content(chunk_size=1 << 18):
+                    f.write(chunk)
 
 
 if __name__ == "__main__":
