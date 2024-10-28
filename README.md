@@ -34,19 +34,47 @@ A single python script to download, extract and install (read "copy to `$HOME/.l
 ghi --help
 ghi get --help
 ghi ls --help
+ghi clean --help
 ```
 
 To download and install the latest release:
 
 ```sh
-ghi get pypa/hatch
+ghi get burntsushi/ripgrep
 ```
 
 To list last 30 releases:
 
 ```sh
-ghi ls pypa/hatch
+ghi ls burntsushi/ripgrep
 ```
+
+To clean-up cached files:
+
+```sh
+ghi clean
+```
+
+To change the install target location:
+
+```sh
+GHI_TARGET_DIR="$HOME/mybin" ghi get burntsushi/ripgrep
+# or
+ghi --target-dir "$HOME/mybin" get burntsushi/ripgrep
+```
+
+To change the download cache directory:
+
+```sh
+GHI_CACHE_DIR="$HOME/mycache" ghi get burntsushi/ripgrep
+# or
+ghi --cache-dir "$HOME/mycache" get burntsushi/ripgrep
+```
+
+**Important:** It is _not_ recommended to run this script in `sudo` mode to install to `/usr/local/bin` or any such location. Instead, use this script with the defaults, and copy the file manually using `sudo cp`. Why? Two reasons:
+
+* This script doesn't protect you against untrusted tar-file or zip-file related exploits.
+* `Path.home()` returns `/root` and the default cache directory changes accordingly, _and_ the downloaded files (in the cache directory) will have `root` as their owner, which will consequently require `sudo` mode to clean up.
 
 ## Alternatives
 

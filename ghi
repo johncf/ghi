@@ -22,6 +22,8 @@ import requests
 
 _TARGET_DIR = Path.home() / ".local" / "bin"
 GHI_TARGET_DIR = os.environ.get("GHI_TARGET_DIR", str(_TARGET_DIR))
+_CACHE_DIR = Path.home() / ".cache" / "ghi"
+GHI_CACHE_DIR = os.environ.get("GHI_CACHE_DIR", str(_CACHE_DIR))
 GITHUB_API_HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
 _TAR_PATTERN = r"\.tar\.(gz|bz2|xz)$|\.(tar|tgz)$"
 _EXTRACTOR_PATTERN = _TAR_PATTERN + r"|\.(zip|gz|bz2)$"
@@ -30,7 +32,8 @@ _CHECKSUM_PATTERN = r"\.sha(256|512)(sum)?$"
 
 def cli():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--target", type=str, default=GHI_TARGET_DIR, help=f"install target directory [default: {GHI_TARGET_DIR}]")
+    parser.add_argument("--target-dir", type=str, default=GHI_TARGET_DIR, help=f"install target directory [default: {GHI_TARGET_DIR}]")
+    parser.add_argument("--cache-dir", type=str, default=GHI_CACHE_DIR, help=f"download cache directory [default: {GHI_CACHE_DIR}]")
     subparsers = parser.add_subparsers(required=True)
 
     # get command
@@ -47,6 +50,10 @@ def cli():
     parser_ls.add_argument("repo", type=str, help="name or url of the repo")
     parser_ls.add_argument("-n", type=int, default=10, help="number of releases to list [default: 10]")
     parser_ls.set_defaults(func=cli_ls)
+
+    # clean command
+    parser_clean = subparsers.add_parser("clean", help="clean-up cache")
+    parser_clean.set_defaults(func=cli_clean)
 
     args = parser.parse_args()
     args.func(args)
@@ -90,7 +97,9 @@ def cli_get(args):
     ranked_details = [f"{assets[i].name} ({size_fmt(assets[i].size)})" for i in ranked_indices]
     chosen_index = pick("Choose an asset", ranked_details)
     chosen_asset = assets[ranked_indices[chosen_index]]
-    output_path = Path(chosen_asset.name)  # TODO temp/cache directory
+    cache_dir = Path(args.cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output_path = cache_dir / chosen_asset.name
     if output_path.exists():
         print("Skipping download; using cached file:", output_path)
         time.sleep(0.6)
@@ -101,6 +110,8 @@ def cli_get(args):
 
     # extract the pre-built binary from the downloaded asset
     print("Reading:", output_path)
+    target_dir = Path(args.target_dir)
+    target_dir.mkdir(parents=True, exist_ok=True)
     if re.search(_EXTRACTOR_PATTERN, output_path.name) is None:
         print("Unsupported file:", output_path)
         return
@@ -113,16 +124,9 @@ def cli_get(args):
             chosen_name = output_path.stem
         target_name = Path(chosen_name).name.split("_", 1)[0]
         exec_name = input(f"Target executable name [default={target_name}] ") or target_name
-        target_path = Path(args.target) / exec_name
+        target_path = target_dir / exec_name
         print("Extracting to:", target_path)
         extractor.extract(chosen_name, target_path)
-
-    # remove the downloaded file
-    print("Downloaded file no longer necessary:", output_path)
-    remove_ok = input("Delete the downloaded file? [Y/n] ")
-    if remove_ok in {"Y", "y", ""}:
-        os.remove(output_path)
-        print("Deleted", output_path)
 
 
 def cli_ls(args):
@@ -137,6 +141,17 @@ def cli_ls(args):
     data = response.json()
     for release in data:
         print(release["tag_name"], "::", release["published_at"])
+
+
+def cli_clean(args):
+    print("Cache directory:", args.cache_dir)
+    cleanup_ok = input("Remove all files in cache directory? [y/N] ")
+    if cleanup_ok not in {"Y", "y", "yes"}:
+        print("Cache directory left untouched")
+        return
+    for file in Path(args.cache_dir).iterdir():
+        print("Deleting", file)
+        file.unlink()
 
 
 @cache
