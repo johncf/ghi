@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 
 import argparse
+import math
 import os
 import platform
 import re
 import shutil
+import stat
 import subprocess
+import tarfile
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 
 import requests
@@ -22,10 +26,12 @@ def cli():
     subparsers = parser.add_subparsers(required=True)
 
     # get command
+    kws, neg_kws = get_platform_keywords()
     parser_get = subparsers.add_parser("get", help="download a github release")
     parser_get.add_argument("repo", type=str, help="name or url of the repo")
-    parser_get.add_argument("-k", action='append', help=f"additional keywords for ranking the release assets [base: {get_platform_keywords()}]")
-    parser_get.add_argument("--tag", default=None, help=f"github release tag [default: latest]")
+    parser_get.add_argument("-k", action='append', dest="kws", help=f"additional keywords for ranking the release assets [base: {kws}]")
+    parser_get.add_argument("-K", action='append', dest="neg_kws", help=f"additional negative keywords for ranking the release assets [base: {neg_kws}]")
+    parser_get.add_argument("-t", "--tag", default=None, help=f"github release tag [default: latest]")
     parser_get.set_defaults(func=cli_get)
 
     # ls command
@@ -41,8 +47,9 @@ def cli():
 def cli_get(args):
     owner, repo = process_github_url(args.repo)
     version = "latest" if args.tag is None else f"tags/{args.tag}"
-    keywords = args.k or []
-    keywords.extend(get_platform_keywords())
+    keywords, neg_keywords = map(list, get_platform_keywords())
+    keywords.extend(args.kws or [])
+    neg_keywords.extend(args.neg_kws or [])
 
     # fetch release data
     response = requests.get(
@@ -66,20 +73,38 @@ def cli_get(args):
         if not asset["name"].endswith(".sha256")
     ]
     asset_names = [asset.name for asset in assets]
-    ranked_indices = rerank_list(asset_names, keywords)
+    if len(asset_names) == 0:
+        print("The release contains no downloadable assets")
+        return
+    ranked_indices = rerank_list(asset_names, keywords, neg_keywords)
 
     # download a user-chosen asset
     ranked_details = [f"{assets[i].name} ({size_fmt(assets[i].size)})"
                       for i in ranked_indices]
     chosen_index = pick("Choose an asset", ranked_details)
     chosen_asset = assets[ranked_indices[chosen_index]]
-    output_path = chosen_asset.name  # TODO temp/cache directory
-    print("Downloading:", chosen_asset.dl_url)
-    dl = Downloader()
-    dl.download(output_path, chosen_asset.dl_url)
+    output_path = Path(chosen_asset.name)  # TODO temp/cache directory
+    if output_path.exists():
+        print("Skipping download; using cached file:", output_path)
+    else:
+        print("Downloading:", chosen_asset.dl_url)
+        dl = Downloader()
+        dl.download(output_path, chosen_asset.dl_url)
 
     # extract the pre-built binary from the downloaded asset
-    # TODO
+    # TODO support zip, and uncompressed files (e.g. exe)
+    print("Reading:", output_path)
+    with tarfile.open(output_path, "r") as tar:
+        for tarinfo in tar:
+            ftyp = tartype2chr(tarinfo.type)
+            mode = stat.filemode(tarinfo.mode)[1:]
+            print(f"{ftyp}{mode} {size_fmt(tarinfo.size, True)} {tarinfo.name}")
+    # TODO unified extractor API:
+    # with compressed_open(output_path) as extractor:
+    #     members = extractor.get_details()  # list of pairs?
+    #     chosen_index = pick([details for _, details in members])
+    #     exec_name = input("Executable name [default={...}] ")
+    #     extractor.extract(members[chosen_index][0], exec_name)
 
 
 def cli_ls(args):
@@ -96,23 +121,27 @@ def cli_ls(args):
         print(release["tag_name"], "::", release["published_at"])
 
 
+@cache
 def get_platform_keywords():
-    keywords = []
+    keywords, neg_keywords = [], []
+
     system = platform.system().lower()
-    if system == "linux":
-        keywords.extend(["linux", "unknown"])
-    elif system == "windows":
-        keywords.extend(["windows", "msvc", ".msi", ".exe"])
-    elif system == "darwin":
-        keywords.extend(["apple", "darwin", ".pkg"])
-    else:
+    append_to = keywords if system == "linux" else neg_keywords
+    append_to.extend(["linux", "unknown"])
+    append_to = keywords if system == "windows" else neg_keywords
+    append_to.extend(["windows", "msvc", ".exe"])
+    append_to = keywords if system == "darwin" else neg_keywords
+    append_to.extend(["apple", "darwin", ".pkg"])
+    kwlen = len(keywords)
+    if kwlen == 0:
         keywords.append(system)
+
     machine = platform.machine().lower()
-    if machine in {"x86_64", "amd64"}:
-        keywords.extend(["x86_64", "amd64", "x64"])
-    else:
+    append_to = keywords if machine in {"x86_64", "amd64"} else neg_keywords
+    append_to.extend(["x86_64", "amd64", "x64"])
+    if len(keywords) == kwlen:
         keywords.append(machine)
-    return keywords
+    return tuple(keywords), tuple(neg_keywords)  # tuple for immutability
 
 
 def process_github_url(repo_url):
@@ -126,36 +155,46 @@ def process_github_url(repo_url):
         raise ValueError(f"Invalid Github URL: {repo_url}")
 
 
-def rerank_list(names, keywords):
-    weights = [-sum(kw in name for kw in keywords) for name in names]
+def rerank_list(names, keywords, neg_keywords=None):
+    if neg_keywords == None:
+        neg_keywords = []
+    weights = [sum(nkw in name for nkw in neg_keywords) - sum(kw in name for kw in keywords) for name in names]
     return [index for _, _, index in sorted(zip(weights, names, range(len(names))))]
 
 
 def pick(prompt, choices):
+    if len(choices) == 0:
+        raise ValueError("There is not even an illusion of choice")
     print()
+    padwidth = int(math.log10(len(choices) - 1)) + 2
     for index, choice in reversed(list(enumerate(choices))):
-        print(f" ({index:3})", choice)
+        print(f" ({index:{padwidth}})", choice)
     print()
     index_str = input(f"{prompt} [default=0] ")
     if index_str == "":
         index_str = "0"
     if not index_str.isdigit():
-        raise ValueError(f"Invalid choice: {index_str}")
+        raise ValueError(f"Not a positive integer: {index_str}")
     index = int(index_str)
     if index >= len(choices):
-        raise ValueError(f"Choice too big: {index} > {len(choices) - 1}")
+        raise ValueError(f"Thinking outside the box is not appreciated: {index} > {len(choices) - 1}")
     return index
 
 
 # based on https://stackoverflow.com/a/1094933/2849934
-def size_fmt(num: int) -> str:
-    if abs(num) < 1024:
-        return f"{num} B"
-    for unit in ("KiB", "MiB", "GiB"):
-        num /= 1024
-        if abs(num) < 1024:
-            return f"{num:.1f} {unit}"
-    return f"{num / 1024:.1f} TiB"
+def size_fmt(num_bytes: int, pad=False) -> str:
+    if num_bytes < 1024:
+        return f"{num_bytes} B" if not pad else f"{num_bytes:6} B  "
+    for unit in ["KiB", "MiB", "GiB", "TiB"]:
+        num_bytes /= 1024
+        if num_bytes < 1024:
+            break
+    return f"{num_bytes:.1f} {unit}" if not pad else f"{num_bytes:6.1f} {unit}"
+
+
+def tartype2chr(tartype):
+    typemap = {tarfile.REGTYPE: "-", tarfile.AREGTYPE: "-", tarfile.LNKTYPE: "-", tarfile.CONTTYPE: "-", tarfile.SYMTYPE: "l", tarfile.DIRTYPE: "d"}
+    return typemap[tartype] if tartype in typemap else "?"
 
 
 @dataclass(kw_only=True)
@@ -169,18 +208,18 @@ class Downloader:
     __slots__ = ("download",)
 
     def __init__(self):
-        if shutil.which("curl") is not None:
-            self.download = self._curl
-        elif shutil.which("wget") is not None:
+        if shutil.which("wget") is not None:
             self.download = self._wget
+        elif shutil.which("curl") is not None:
+            self.download = self._curl
         else:
             self.download = self._pyreq
 
     def _wget(self, outfile, url):
-        subprocess.run(["wget", "-nv", "-O", outfile, url])
+        subprocess.run(["wget", "-nv", "-O", str(outfile), url])
 
     def _curl(self, outfile, url):
-        subprocess.run(["curl", "-sS", "-fLo", outfile, url])
+        subprocess.run(["curl", "-sS", "-fLo", str(outfile), url])
 
     def _pyreq(self, outfile, url):
         with requests.get(url, stream=True) as resp:
