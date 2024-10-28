@@ -48,10 +48,6 @@ To list last 30 releases:
 ghi ls pypa/hatch
 ```
 
-## Contributing
-
-If you'd like to add/improve support for various platforms, please feel free to create an issue or pull request. Please note that all code must live in a single file, and adding new dependencies should be avoided. If you'd like to add a new feature, please take care to keep things simple as far as possible.
-
 ## Alternatives
 
-* [install-release](https://github.com/Rishang/install-release): more feature-rich Github release installer; requires `pip` or `pipx` to install and use
+* [install-release](https://github.com/Rishang/install-release): more feature-rich Github release installer; requires installation as a python package to use
