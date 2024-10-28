@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import bz2
+import gzip
 import math
 import os
 import platform
@@ -9,15 +11,21 @@ import shutil
 import stat
 import subprocess
 import tarfile
-from dataclasses import dataclass
+import time
+from collections import namedtuple
+from contextlib import contextmanager
 from functools import cache
 from pathlib import Path
+from zipfile import ZipFile
 
 import requests
 
 _TARGET_DIR = Path.home() / ".local" / "bin"
 GHI_TARGET_DIR = os.environ.get("GHI_TARGET_DIR", str(_TARGET_DIR))
 GITHUB_API_HEADERS = {"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+_TAR_PATTERN = r"\.tar\.(gz|bz2|xz)$|\.(tar|tgz)$"
+_EXTRACTOR_PATTERN = _TAR_PATTERN + r"|\.(zip|gz|bz2)$"
+_CHECKSUM_PATTERN = r"\.sha(256|512)(sum)?$"
 
 
 def cli():
@@ -70,41 +78,51 @@ def cli_get(args):
     assets = [
         Asset(name=asset["name"], size=asset["size"], dl_url=asset["browser_download_url"])
         for asset in data["assets"]
-        if not asset["name"].endswith(".sha256")
+        if re.search(_CHECKSUM_PATTERN, asset["name"], re.IGNORECASE) is None
     ]
-    asset_names = [asset.name for asset in assets]
-    if len(asset_names) == 0:
-        print("The release contains no downloadable assets")
+    if len(assets) == 0:
+        print("The release contains no relevant assets")
         return
-    ranked_indices = rerank_list(asset_names, keywords, neg_keywords)
 
-    # download a user-chosen asset
-    ranked_details = [f"{assets[i].name} ({size_fmt(assets[i].size)})"
-                      for i in ranked_indices]
+    # let the user pick an asset, and download it
+    asset_names = [asset.name for asset in assets]
+    ranked_indices = rerank_list(asset_names, keywords, neg_keywords)
+    ranked_details = [f"{assets[i].name} ({size_fmt(assets[i].size)})" for i in ranked_indices]
     chosen_index = pick("Choose an asset", ranked_details)
     chosen_asset = assets[ranked_indices[chosen_index]]
     output_path = Path(chosen_asset.name)  # TODO temp/cache directory
     if output_path.exists():
         print("Skipping download; using cached file:", output_path)
+        time.sleep(0.6)
     else:
         print("Downloading:", chosen_asset.dl_url)
         dl = Downloader()
         dl.download(output_path, chosen_asset.dl_url)
 
     # extract the pre-built binary from the downloaded asset
-    # TODO support zip, and uncompressed files (e.g. exe)
     print("Reading:", output_path)
-    with tarfile.open(output_path, "r") as tar:
-        for tarinfo in tar:
-            ftyp = tartype2chr(tarinfo.type)
-            mode = stat.filemode(tarinfo.mode)[1:]
-            print(f"{ftyp}{mode} {size_fmt(tarinfo.size, True)} {tarinfo.name}")
-    # TODO unified extractor API:
-    # with compressed_open(output_path) as extractor:
-    #     members = extractor.get_details()  # list of pairs?
-    #     chosen_index = pick([details for _, details in members])
-    #     exec_name = input("Executable name [default={...}] ")
-    #     extractor.extract(members[chosen_index][0], exec_name)
+    if re.search(_EXTRACTOR_PATTERN, output_path.name) is None:
+        print("Unsupported file:", output_path)
+        return
+    with compressed_open(output_path) as extractor:
+        details_list = extractor.get_details()
+        if details_list is not None:
+            chosen_index = pick("Choose the executable", [details for _, details in details_list])
+            chosen_name = details_list[chosen_index][0]
+        else:
+            chosen_name = output_path.stem
+        target_name = Path(chosen_name).name.split("_", 1)[0]
+        exec_name = input(f"Target executable name [default={target_name}] ") or target_name
+        target_path = Path(args.target) / exec_name
+        print("Extracting to:", target_path)
+        extractor.extract(chosen_name, target_path)
+
+    # remove the downloaded file
+    print("Downloaded file no longer necessary:", output_path)
+    remove_ok = input("Delete the downloaded file? [Y/n] ")
+    if remove_ok in {"Y", "y", ""}:
+        os.remove(output_path)
+        print("Deleted", output_path)
 
 
 def cli_ls(args):
@@ -158,26 +176,30 @@ def process_github_url(repo_url):
 def rerank_list(names, keywords, neg_keywords=None):
     if neg_keywords == None:
         neg_keywords = []
-    weights = [sum(nkw in name for nkw in neg_keywords) - sum(kw in name for kw in keywords) for name in names]
+    weights = [sum(nkw in name.lower() for nkw in neg_keywords) - sum(kw in name.lower() for kw in keywords) for name in names]
     return [index for _, _, index in sorted(zip(weights, names, range(len(names))))]
 
 
 def pick(prompt, choices):
     if len(choices) == 0:
-        raise ValueError("There is not even an illusion of choice")
+        raise ValueError("Not even an illusion of choice")
     print()
-    padwidth = int(math.log10(len(choices) - 1)) + 2
+    padwidth = int(math.log10(max(1, len(choices) - 1))) + 2
     for index, choice in reversed(list(enumerate(choices))):
         print(f" ({index:{padwidth}})", choice)
     print()
-    index_str = input(f"{prompt} [default=0] ")
+    index_str = ""
+    if len(choices) > 1:
+        index_str = input(f"{prompt} [default=0] ")
+    else:
+        print(f"{prompt} [default=0] (auto-selected the only choice)")
     if index_str == "":
         index_str = "0"
     if not index_str.isdigit():
         raise ValueError(f"Not a positive integer: {index_str}")
     index = int(index_str)
     if index >= len(choices):
-        raise ValueError(f"Thinking outside the box is not appreciated: {index} > {len(choices) - 1}")
+        raise ValueError(f"Thinking outside the box: {index} > {len(choices) - 1}")
     return index
 
 
@@ -192,16 +214,97 @@ def size_fmt(num_bytes: int, pad=False) -> str:
     return f"{num_bytes:.1f} {unit}" if not pad else f"{num_bytes:6.1f} {unit}"
 
 
+@contextmanager
+def compressed_open(filepath: str | Path):
+    filepath = Path(filepath)
+    if re.search(_TAR_PATTERN, filepath.name) is not None:
+        with tarfile.open(filepath) as tarobj:
+            yield TarExtractor(tarobj)
+    elif filepath.name.endswith(".zip"):
+        with ZipFile(filepath) as zipobj:
+            yield ZipExtractor(zipobj)
+    elif filepath.name.endswith(".gz"):
+        with gzip.open(filepath) as fileobj:
+            yield IdentityExtractor(fileobj)
+    elif filepath.name.endswith(".bz2"):
+        with bz2.open(filepath) as fileobj:
+            yield IdentityExtractor(fileobj)
+    else:
+        raise ValueError(f"Unsupported file: {filepath}")
+
+
 def tartype2chr(tartype):
-    typemap = {tarfile.REGTYPE: "-", tarfile.AREGTYPE: "-", tarfile.LNKTYPE: "-", tarfile.CONTTYPE: "-", tarfile.SYMTYPE: "l", tarfile.DIRTYPE: "d"}
+    typemap = {tarfile.REGTYPE: "-", tarfile.AREGTYPE: "-", tarfile.SYMTYPE: "l", tarfile.DIRTYPE: "d"}
     return typemap[tartype] if tartype in typemap else "?"
 
 
-@dataclass(kw_only=True)
-class Asset:
-    name: str
-    size: int
-    dl_url: str
+# see https://stackoverflow.com/a/14105527/2849934
+def chmod_a_plus_x(fileno):
+    mode = os.fstat(fileno).st_mode
+    mode |= 0o111  # executable bits
+    os.fchmod(fileno, mode & 0o7777)
+
+
+class TarExtractor:
+    def __init__(self, tarobj: tarfile.TarFile):
+        self._tar = tarobj
+
+    def get_details(self):
+        # the largest file is usually the file of interest
+        tarinfos = sorted(self._tar.getmembers(), key=lambda ti: -ti.size)
+        details_list = []
+        for tarinfo in tarinfos:
+            ftyp = tartype2chr(tarinfo.type)
+            if ftyp != "-": continue  # skip non-regular files
+            mode = stat.filemode(tarinfo.mode)[1:]
+            details_list.append((tarinfo.name, f"{ftyp}{mode} {size_fmt(tarinfo.size, True)} {tarinfo.name}"))
+        return details_list
+
+    def extract(self, member_name, target_path: Path | str):
+        target_path = Path(target_path)
+        member = self._tar.getmember(member_name)
+        member.name = target_path.name
+        if not member.isreg():
+            raise RuntimeError("Not a regular file")
+        # TODO use filter="data" once Python 3.12 becomes common
+        self._tar.extract(member, path=target_path.parent)
+
+
+class ZipExtractor:
+    def __init__(self, zipobj: ZipFile):
+        self._zip = zipobj
+
+    def get_details(self):
+        # the largest file is usually the file of interest
+        zipinfos = sorted(self._zip.infolist(), key=lambda zi: -zi.file_size)
+        details_list = []
+        for zipinfo in zipinfos:
+            if zipinfo.is_dir(): continue  # skip directories
+            mode = stat.filemode(zipinfo.external_attr >> 16)
+            details_list.append((zipinfo.filename, f"{mode} {size_fmt(zipinfo.file_size, True)} {zipinfo.filename}"))
+        return details_list
+
+    def extract(self, member_name, target_path: Path | str):
+        with self._zip.open(member_name) as zfd:
+            with open(target_path, "wb") as outfd:
+                shutil.copyfileobj(zfd, outfd)
+                chmod_a_plus_x(outfd.fileno())
+
+
+class IdentityExtractor:
+    def __init__(self, fileobj):
+        self._fd = fileobj
+
+    def get_details(self):
+        return None
+
+    def extract(self, _, target_path: Path | str):
+        with open(target_path, "wb") as outfd:
+            shutil.copyfileobj(self._fd, outfd)
+            chmod_a_plus_x(outfd.fileno())
+
+
+Asset = namedtuple("Asset", ["name", "size", "dl_url"])
 
 
 class Downloader:
